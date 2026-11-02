@@ -3,7 +3,8 @@
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
-const PLATES = ["A", "B", "C", "D"];
+/** Plate columns assumed when the Excel header has no "X PLATE" titles. */
+const LEGACY_PLATES = ["A", "B", "C", "D"];
 /** 30×74 mm / 30×85 mm label short/long sides in PDF points (±tolerance). */
 const LABEL_SHORT_MIN = 78;
 const LABEL_SHORT_MAX = 95;
@@ -65,7 +66,8 @@ async function runCompose() {
     const ratio = await parseRatioExcel(excelFile);
     log(`Styles in Excel: ${ratio.styles.join(", ")}`);
     log(
-      `Impressions — A:${ratio.impressions.A} B:${ratio.impressions.B} C:${ratio.impressions.C} D:${ratio.impressions.D}`
+      `Plates: ${ratio.plates.length} — ` +
+        ratio.plates.map((p) => `${p}:Imp ${ratio.impressions[p] || 0}`).join(" ")
     );
 
     setProgress(12, "Detecting slots from layout master…");
@@ -80,24 +82,17 @@ async function runCompose() {
     log(`Matched label artworks: ${Object.keys(labelMap).length}`);
 
     setProgress(45, "Building plate queues from Excel…");
-    const plateQueues = buildPlateQueues(ratio.rows, labelMap);
+    const plateQueues = buildPlateQueues(ratio.rows, labelMap, ratio.plates);
     const slotCount = layout.slots.length;
     renderPlateSummary(plateQueues, ratio.impressions, slotCount);
-
-    for (const plate of PLATES) {
-      if (plateQueues[plate].length !== slotCount) {
-        throw new Error(
-          `Plate ${plate} has ${plateQueues[plate].length} labels; layout has ${slotCount} slots. ` +
-            `Excel totals must match the master ups count.`
-        );
-      }
-    }
+    const pages = buildPlatePages(plateQueues, slotCount);
+    if (!pages.length) throw new Error("No plate in the Excel has any label quantity.");
 
     setProgress(55, "Composing final PDF pages…");
     const pdfBytes = await composeFinalPdf({
       layoutFile,
       layout,
-      plateQueues,
+      pages,
       impressions: ratio.impressions,
       styles: ratio.styles,
       dateText: els.dateText.value.trim() || formatDate(new Date()),
@@ -193,8 +188,9 @@ async function parseRatioExcel(file) {
   const rows = [];
   const styles = [];
   let currentStyle = null;
-  let impressions = { A: 0, B: 0, C: 0, D: 0 };
   const cols = detectRatioColumns(matrix[0] || []);
+  const plates = cols.plates.map((p) => p.name);
+  const impressions = Object.fromEntries(plates.map((p) => [p, 0]));
   const cell = (row, col) => (col >= 0 && row[col] != null ? String(row[col]).trim() : "");
 
   for (let i = 1; i < matrix.length; i++) {
@@ -204,13 +200,8 @@ async function parseRatioExcel(file) {
     const ean = cell(row, cols.ean).replace(/\D/g, "");
 
     // Footer impression row: Imp_142 sheet, Imp_ 20 sheet, etc.
-    if (!size && !ean && PLATES.some((p) => /Imp_/i.test(cell(row, cols[p])))) {
-      impressions = {
-        A: parseImp(row[cols.A]),
-        B: parseImp(row[cols.B]),
-        C: parseImp(row[cols.C]),
-        D: parseImp(row[cols.D]),
-      };
+    if (!size && !ean && cols.plates.some((p) => /Imp_/i.test(cell(row, p.col)))) {
+      for (const p of cols.plates) impressions[p.name] = parseImp(row[p.col]);
       continue;
     }
 
@@ -225,20 +216,19 @@ async function parseRatioExcel(file) {
       size,
       ean,
       colour: cell(row, cols.colour),
-      A: toCount(row[cols.A]),
-      B: toCount(row[cols.B]),
-      C: toCount(row[cols.C]),
-      D: toCount(row[cols.D]),
+      counts: Object.fromEntries(cols.plates.map((p) => [p.name, toCount(row[p.col])])),
     });
   }
 
   if (!rows.length) throw new Error("No size rows found in Excel.");
-  return { rows, styles, impressions };
+  return { rows, styles, impressions, plates };
 }
 
 /**
  * Map header names to columns. Supports "Size / EAN Code" (Dunnes) and
- * "UPC / Colour" (M&S) sheets; falls back to the legacy fixed positions.
+ * "UPC / Size / Colour" (M&S) sheets. Plates are every "<X> PLATE" / "PLATE <X>"
+ * header, in sheet order — any number of them. Without such headers, falls back
+ * to the legacy fixed A–D columns.
  */
 function detectRatioColumns(header) {
   const names = header.map((v) => String(v ?? "").trim().toLowerCase());
@@ -247,11 +237,15 @@ function detectRatioColumns(header) {
     size: find(/size/),
     ean: find(/ean|upc|barcode/),
     colour: find(/colou?r/),
+    plates: [],
   };
-  for (const p of PLATES) {
-    cols[p] = find(new RegExp(`^(${p}\\s*plate|plate\\s*${p})$`, "i"));
+  names.forEach((v, col) => {
+    const m = v.match(/^([a-z0-9]+)\s*plate$|^plate\s*[-_]?\s*([a-z0-9]+)$/i);
+    if (m) cols.plates.push({ name: (m[1] || m[2]).toUpperCase(), col });
+  });
+  if (!cols.plates.length) {
+    cols.plates = LEGACY_PLATES.map((name, i) => ({ name, col: 3 + i }));
   }
-  if (PLATES.some((p) => cols[p] < 0)) PLATES.forEach((p, i) => (cols[p] = 3 + i));
   if (cols.size < 0 && cols.ean < 0) {
     cols.size = 1;
     cols.ean = 2;
@@ -322,7 +316,7 @@ async function extractLabelsFromOutlines(files, excelRows) {
 
   // Ensure every excel row with any plate qty has artwork
   for (const row of excelRows) {
-    if (row.A + row.B + row.C + row.D === 0) continue;
+    if (Object.values(row.counts).every((n) => n === 0)) continue;
     const key = labelKey(row.style, row.ean || row.size);
     if (!labelMap[key]) {
       throw new Error(`Missing artwork for ${row.style} / ${rowName(row)} (EAN ${row.ean}).`);
@@ -572,7 +566,7 @@ function wrapContentInLocalFormSpace(content, label) {
 /** Remove the layout master's placeholder Plate A/B/C/D margin text (avoids duplicates). */
 function stripLayoutPlateText(contentText) {
   return contentText.replace(/BT\n[\s\S]*?\nET\n/g, (block) =>
-    /\(Plate\s+[A-D]/.test(block) ? "" : block
+    /\(Plate\s+[A-Z0-9]/.test(block) ? "" : block
   );
 }
 
@@ -1224,7 +1218,7 @@ function stripPlateTextLine(contentText) {
     }
   }
 
-  const target = lines.find((l) => /Plate[\s\-_]*[A-D]\b/i.test(l.text));
+  const target = lines.find((l) => /Plate[\s\-_]*[A-Z0-9]+\b/i.test(l.text));
   if (!target) return null;
   let content = contentText;
   for (const o of [...target.shows].sort((a, b) => b.start - a.start)) {
@@ -1248,7 +1242,7 @@ function stripPlateTextLine(contentText) {
 /** Fill a master's plate line template with this plate's values. */
 function fillPlateLineTemplate(text, { plate, impression, woCompact, dateText, doneBy }) {
   return text
-    .replace(/(Plate[\s\-_]*)[A-D]([\s\-_]*)\d*/i, (_, pre, mid) => `${pre}${plate}${mid}${impression}`)
+    .replace(/(Plate[\s\-_]*)[A-Z0-9]+([\s\-_]+)\d*/i, (_, pre, mid) => `${pre}${plate}${mid}${impression}`)
     .replace(/BD\d{8,}W(?:\+\d+W)*/i, () => woCompact)
     .replace(/(Date\s*:\s*)[^,_]*/i, (_, pre) => `${pre}${dateText}`)
     .replace(/(Done\s*by\s*-?\s*).*$/i, (_, pre) => `${pre}${doneBy}`);
@@ -1398,13 +1392,14 @@ function dedupeFrames(frames) {
   return out;
 }
 
-function buildPlateQueues(rows, labelMap) {
-  const queues = { A: [], B: [], C: [], D: [] };
+/** Plate name → labels in production order (Excel row order, repeated by count). */
+function buildPlateQueues(rows, labelMap, plates) {
+  const queues = Object.fromEntries(plates.map((p) => [p, []]));
   for (const row of rows) {
     const key = labelKey(row.style, row.ean || row.size);
     const art = labelMap[key];
-    for (const plate of PLATES) {
-      const count = row[plate];
+    for (const plate of plates) {
+      const count = row.counts[plate] || 0;
       for (let i = 0; i < count; i++) {
         queues[plate].push(art);
       }
@@ -1413,14 +1408,46 @@ function buildPlateQueues(rows, labelMap) {
   return queues;
 }
 
+/**
+ * Split plate queues into output pages of `slotCount` ups. A plate with fewer
+ * labels leaves its last slots empty; one with more continues on extra sheets;
+ * an empty plate is skipped.
+ */
+function buildPlatePages(queues, slotCount) {
+  const pages = [];
+  for (const [plate, queue] of Object.entries(queues)) {
+    if (!queue.length) {
+      log(`Plate ${plate}: no labels in Excel — skipped.`);
+      continue;
+    }
+    const sheets = Math.ceil(queue.length / slotCount);
+    if (queue.length % slotCount) {
+      log(
+        `⚠ Plate ${plate}: ${queue.length} labels for ${slotCount} slots — ` +
+          `${sheets * slotCount - queue.length} slot(s) left empty.`
+      );
+    }
+    if (sheets > 1) log(`⚠ Plate ${plate}: ${queue.length} labels need ${sheets} sheets.`);
+    for (let s = 0; s < sheets; s++) {
+      pages.push({
+        plate,
+        sheet: s + 1,
+        sheets,
+        labels: queue.slice(s * slotCount, (s + 1) * slotCount),
+      });
+    }
+  }
+  return pages;
+}
+
 function renderPlateSummary(queues, impressions, slotCount) {
-  els.plateSummary.innerHTML = PLATES.map((plate) => {
+  els.plateSummary.innerHTML = Object.keys(queues).map((plate) => {
     const items = queues[plate]
       .map((l) => `${l.style}/${rowName(l)}`)
       .join(", ");
     const ok = queues[plate].length === slotCount;
     return `<article class="plate-card">
-      <strong>Plate ${plate} — ${queues[plate].length}/${slotCount} labels · Imp ${impressions[plate] || 0}${ok ? "" : " ⚠ mismatch"}</strong>
+      <strong>Plate ${plate} — ${queues[plate].length}/${slotCount} labels · Imp ${impressions[plate] || 0}${ok ? "" : " ⚠ not a full sheet"}</strong>
       <code>${escapeHtml(items)}</code>
     </article>`;
   }).join("");
@@ -1430,7 +1457,7 @@ function renderPlateSummary(queues, impressions, slotCount) {
 async function composeFinalPdf({
   layoutFile,
   layout,
-  plateQueues,
+  pages,
   impressions,
   styles,
   dateText,
@@ -1534,16 +1561,18 @@ async function composeFinalPdf({
     return form;
   }
 
-  for (let p = 0; p < PLATES.length; p++) {
-    setProgress(55 + p * 10, `Stamping Plate ${PLATES[p]}…`);
-    const plate = PLATES[p];
+  for (let p = 0; p < pages.length; p++) {
+    const { plate: plateName, sheet, sheets, labels } = pages[p];
+    // Overflow sheets of one plate are tagged "A (1/2)", "A (2/2)".
+    const plate = sheets > 1 ? `${plateName} (${sheet}/${sheets})` : plateName;
+    setProgress(55 + Math.round((p / pages.length) * 40), `Stamping Plate ${plate}…`);
     const [page] = await outPdf.copyPages(layoutPdf, [0]);
     outPdf.addPage(page);
 
     if (plateLine) {
       const margin = fillPlateLineTemplate(plateLine.text, {
         plate,
-        impression: impressions[plate] || 0,
+        impression: impressions[plateName] || 0,
         woCompact,
         dateText,
         doneBy,
@@ -1558,7 +1587,7 @@ async function composeFinalPdf({
       });
     } else {
       const margin =
-        `Plate ${plate} - ${impressions[plate] || 0} _ W/O _${woCompact}_ Date : ${dateText}, Done by- ${doneBy}`;
+        `Plate ${plate} - ${impressions[plateName] || 0} _ W/O _${woCompact}_ Date : ${dateText}, Done by- ${doneBy}`;
       page.drawText(margin, {
         x: pageW - 28,
         y: 40,
@@ -1569,10 +1598,9 @@ async function composeFinalPdf({
       });
     }
 
-    const queue = plateQueues[plate];
-    for (let i = 0; i < slots.length; i++) {
-      const label = queue[i];
-      const form = await formForLabel(label);
+    // Slots past the last label keep the master's empty cut box.
+    for (let i = 0; i < labels.length; i++) {
+      const form = await formForLabel(labels[i]);
       drawCroppedLabel(page, form, slots[i], cutOpsForSlot(i));
     }
   }
