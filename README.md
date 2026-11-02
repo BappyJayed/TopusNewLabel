@@ -3,16 +3,16 @@
 Browser tool that builds plate PDFs from:
 
 1. **Outline label PDFs** (one per style)
-2. **Ratio master Excel** (size / EAN — or UPC / Colour — and A–D plate counts; columns found by header)
+2. **Ratio master Excel** (size / EAN — or UPC / Colour — and plate counts; columns found by header)
 3. **Layout master PDF** (slots auto-detected from ~30×74 or 30×85 mm cut boxes, square or rounded)
 
 ## How it works
 
-- **Plate A/B/C/D = pages 1–4**
+- **One page per plate column** — every `A PLATE`, `B PLATE`, … header in the Excel (any number of plates)
 - Excel cell values are how many of that size go on each plate
 - Labels are placed in production order: Excel row order, repeated by count
 - **Layout slots are detected dynamically** from the uploaded master (portrait + landscape cut rectangles), sorted top→bottom, left→right
-- Excel totals per plate must equal the detected ups count
+- A plate with fewer labels than slots leaves the last slots empty; one with more continues on extra sheets (`Plate-B (1/2)`, `(2/2)`); a plate with no labels is skipped — each case is noted in the log
 - Landscape slots receive artwork rotated 90° clockwise
 - Label artwork is placed as vectors from the outline PDFs (not flattened to images)
 - Each size is cropped to its own cut box before stamping, so Illustrator does not keep sibling labels behind the art
