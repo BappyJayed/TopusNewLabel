@@ -291,9 +291,11 @@ async function extractLabelsFromOutlines(files, excelRows) {
 
     const buffer = await file.arrayBuffer();
     const blocks = await extractCroppedLabelBlocks(buffer);
+    const pageCount = new Set(blocks.map((b) => b.pageIndex)).size;
+    const pagesNote = pageCount > 1 ? ` (${pageCount} pages)` : "";
     if (blocks.length !== expected.length) {
       throw new Error(
-        `${style}: found ${blocks.length} label frames but Excel has ${expected.length} sizes.`
+        `${style}: found ${blocks.length} label frames${pagesNote} but Excel has ${expected.length} sizes.`
       );
     }
 
@@ -306,12 +308,13 @@ async function extractLabelsFromOutlines(files, excelRows) {
         ean: row.ean,
         fileName: file.name,
         pdfBytes: buffer,
+        pageIndex: block.pageIndex,
         clip: { x: block.x, y: block.y, w: block.w, h: block.h },
         content: block.content,
       };
     });
 
-    log(`${style}: cropped ${blocks.length} vector sizes from ${file.name}`);
+    log(`${style}: cropped ${blocks.length} vector sizes from ${file.name}${pagesNote}`);
   }
 
   // Ensure every excel row with any plate qty has artwork
@@ -352,16 +355,24 @@ function labelKey(style, eanOrSize) {
 async function extractCroppedLabelBlocks(buffer) {
   const { PDFDocument } = PDFLib;
   const src = await PDFDocument.load(buffer.slice(0));
-  const srcPage = src.getPages()[0];
+  // Styles with many sizes spill onto extra pages; read them all, in page order.
+  const all = [];
+  src.getPages().forEach((srcPage, pageIndex) => {
+    const blocks = extractPageLabelBlocks(srcPage);
+    for (const block of blocks) all.push({ ...block, pageIndex });
+  });
+  if (!all.length) throw new Error("Could not detect label frames in outline PDF.");
+  return all;
+}
+
+function extractPageLabelBlocks(srcPage) {
   const contentText = getPageContentText(srcPage);
   let blocks = extractLabelContentBlocks(contentText);
   // Outlined-font artwork (no per-label clip groups): split by geometry instead.
   // Keep drawing order there — those sheets may be laid out column-major
   // (top→bottom, then next column) and their drawing order follows the Excel.
   if (!blocks.length) {
-    blocks = extractLabelBlocksBySpatialScan(contentText, makeXObjectBoxResolver(srcPage));
-    if (!blocks.length) throw new Error("Could not detect label frames in outline PDF.");
-    return blocks;
+    return extractLabelBlocksBySpatialScan(contentText, makeXObjectBoxResolver(srcPage));
   }
   // sortX/sortY are the original page positions (clip is local 0..w x 0..h).
   blocks.sort((a, b) => {
@@ -1513,13 +1524,15 @@ async function composeFinalPdf({
     };
   }
 
-  async function resourcesForOutline(pdfBytes) {
-    const cached = resourcesBySource.get(pdfBytes);
+  async function resourcesForOutline(pdfBytes, pageIndex) {
+    if (!resourcesBySource.has(pdfBytes)) resourcesBySource.set(pdfBytes, new Map());
+    const byPage = resourcesBySource.get(pdfBytes);
+    const cached = byPage.get(pageIndex);
     if (cached) return cached;
 
-    // Import fonts/XObjects once via a tiny donor form (not the full sheet art).
+    // Import fonts/XObjects once per source page via a tiny donor form (not the full sheet art).
     const src = await PDFDocument.load(pdfBytes.slice(0));
-    const srcPage = src.getPages()[0];
+    const srcPage = src.getPages()[pageIndex];
     srcPage.node.set(
       PDFName.of("Contents"),
       src.context.register(src.context.flateStream(latin1ToBytes("\n")))
@@ -1532,7 +1545,7 @@ async function composeFinalPdf({
     });
     await donor.embed();
     const resources = outPdf.context.lookup(donor.ref).dict.get(PDFName.of("Resources"));
-    resourcesBySource.set(pdfBytes, resources);
+    byPage.set(pageIndex, resources);
     return resources;
   }
 
@@ -1541,7 +1554,7 @@ async function composeFinalPdf({
     const cached = formByLabel.get(key);
     if (cached) return cached;
 
-    const resources = await resourcesForOutline(label.pdfBytes);
+    const resources = await resourcesForOutline(label.pdfBytes, label.pageIndex || 0);
     const { w, h } = label.clip;
     // Content is already rewritten into local 0..w x 0..h space. Keep an
     // identity Matrix so Illustrator does not invent ghost frames from a

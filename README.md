@@ -2,7 +2,7 @@
 
 Browser tool that builds plate PDFs from:
 
-1. **Outline label PDFs** (one per style)
+1. **Outline label PDFs** (one per style; styles with many sizes may span several pages — all pages are read in order)
 2. **Ratio master Excel** (size / EAN — or UPC / Colour — and plate counts; columns found by header)
 3. **Layout master PDF** (slots auto-detected from ~30×74 or 30×85 mm cut boxes, square or rounded)
 
